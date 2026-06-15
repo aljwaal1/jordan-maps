@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
@@ -50,11 +49,27 @@ class PlaceResult {
     required this.name,
     required this.latLng,
     required this.type,
+    this.distanceMeters,
   });
 
   final String name;
   final LatLng latLng;
   final String type;
+  final double? distanceMeters;
+}
+
+class SearchCategory {
+  const SearchCategory({
+    required this.label,
+    required this.icon,
+    required this.filters,
+    required this.keywords,
+  });
+
+  final String label;
+  final IconData icon;
+  final List<String> filters;
+  final List<String> keywords;
 }
 
 class JordanMapPage extends StatefulWidget {
@@ -74,6 +89,88 @@ class _JordanMapPageState extends State<JordanMapPage> {
   final MapController _mapController = MapController();
   final TextEditingController _searchController = TextEditingController();
   final Distance _distance = const Distance();
+
+  static const List<SearchCategory> _categories = [
+    SearchCategory(
+      label: 'محلات',
+      icon: Icons.storefront,
+      filters: ['["shop"]'],
+      keywords: ['محل', 'محلات', 'متجر', 'متاجر', 'تجاري', 'تجارية', 'shop', 'store'],
+    ),
+    SearchCategory(
+      label: 'بقالة',
+      icon: Icons.local_grocery_store,
+      filters: [
+        '["shop"="supermarket"]',
+        '["shop"="convenience"]',
+        '["shop"="grocery"]',
+      ],
+      keywords: ['بقالة', 'سوبر', 'سوبرماركت', 'سوبر ماركت', 'تموين', 'مواد غذائية', 'grocery', 'supermarket'],
+    ),
+    SearchCategory(
+      label: 'مطاعم',
+      icon: Icons.restaurant,
+      filters: [
+        '["amenity"="restaurant"]',
+        '["amenity"="fast_food"]',
+        '["amenity"="food_court"]',
+      ],
+      keywords: ['مطعم', 'مطاعم', 'اكل', 'أكل', 'وجبات', 'restaurant', 'food'],
+    ),
+    SearchCategory(
+      label: 'كافيه',
+      icon: Icons.local_cafe,
+      filters: [
+        '["amenity"="cafe"]',
+        '["shop"="coffee"]',
+      ],
+      keywords: ['كافيه', 'كوفي', 'قهوة', 'مقهى', 'مقاهي', 'cafe', 'coffee'],
+    ),
+    SearchCategory(
+      label: 'صيدليات',
+      icon: Icons.local_pharmacy,
+      filters: [
+        '["amenity"="pharmacy"]',
+        '["shop"="chemist"]',
+      ],
+      keywords: ['صيدلية', 'صيدليات', 'دواء', 'pharmacy'],
+    ),
+    SearchCategory(
+      label: 'وقود',
+      icon: Icons.local_gas_station,
+      filters: ['["amenity"="fuel"]'],
+      keywords: ['بنزين', 'محطة', 'وقود', 'كازية', 'fuel', 'gas'],
+    ),
+    SearchCategory(
+      label: 'بنوك',
+      icon: Icons.account_balance,
+      filters: [
+        '["amenity"="bank"]',
+        '["amenity"="atm"]',
+      ],
+      keywords: ['بنك', 'بنوك', 'صراف', 'atm', 'bank'],
+    ),
+    SearchCategory(
+      label: 'مستشفيات',
+      icon: Icons.local_hospital,
+      filters: [
+        '["amenity"="hospital"]',
+        '["amenity"="clinic"]',
+        '["healthcare"]',
+      ],
+      keywords: ['مستشفى', 'مستشفيات', 'عيادة', 'عيادات', 'طبيب', 'hospital', 'clinic'],
+    ),
+    SearchCategory(
+      label: 'مدارس',
+      icon: Icons.school,
+      filters: [
+        '["amenity"="school"]',
+        '["amenity"="university"]',
+        '["amenity"="college"]',
+      ],
+      keywords: ['مدرسة', 'مدارس', 'جامعة', 'كلية', 'school', 'university'],
+    ),
+  ];
 
   Position? _currentPosition;
   LatLng? _selectedDestination;
@@ -147,7 +244,13 @@ class _JordanMapPageState extends State<JordanMapPage> {
   Future<void> _searchJordan() async {
     final query = _searchController.text.trim();
     if (query.isEmpty) {
-      _showMessage('اكتب اسم مدينة أو مكان داخل الأردن');
+      _showMessage('اكتب اسم مكان أو اختر فئة مثل محلات أو مطاعم');
+      return;
+    }
+
+    final category = _categoryForQuery(query);
+    if (category != null) {
+      await _searchBusinessCategory(category);
       return;
     }
 
@@ -213,6 +316,200 @@ class _JordanMapPageState extends State<JordanMapPage> {
       }
     }
   }
+
+  Future<void> _searchBusinessCategory(SearchCategory category) async {
+    FocusScope.of(context).unfocus();
+    final center = _searchCenter();
+    const radiusMeters = 18000;
+
+    setState(() {
+      _isSearching = true;
+      _results = [];
+      _routePoints = [];
+      _routeInfo = null;
+      _status = 'جاري البحث عن ${category.label} حول موقعك...';
+    });
+
+    try {
+      final query = _buildOverpassQuery(category, center, radiusMeters);
+      final response = await http
+          .post(
+            Uri.https('overpass-api.de', '/api/interpreter'),
+            headers: const {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'User-Agent': 'jordan_maps_online/1.0 contact:yaya15112016@gmail.com',
+            },
+            body: {'data': query},
+          )
+          .timeout(const Duration(seconds: 28));
+
+      if (response.statusCode != 200) {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final elements = (data['elements'] as List<dynamic>? ?? const []);
+      final seen = <String>{};
+      final items = <PlaceResult>[];
+
+      for (final raw in elements) {
+        final map = raw as Map<String, dynamic>;
+        final tags = (map['tags'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+        final lat = _readLat(map);
+        final lon = _readLon(map);
+        if (lat == null || lon == null) continue;
+
+        final latLng = LatLng(lat, lon);
+        if (!_jordanBounds.contains(latLng)) continue;
+
+        final name = _placeName(tags, category.label);
+
+        final key = '${lat.toStringAsFixed(6)},${lon.toStringAsFixed(6)},$name';
+        if (!seen.add(key)) continue;
+
+        final distanceMeters = _distance.as(LengthUnit.Meter, center, latLng);
+        items.add(
+          PlaceResult(
+            name: name,
+            latLng: latLng,
+            type: _placeType(tags, category.label),
+            distanceMeters: distanceMeters,
+          ),
+        );
+      }
+
+      items.sort((a, b) => (a.distanceMeters ?? 0).compareTo(b.distanceMeters ?? 0));
+      final limited = items.take(30).toList();
+
+      setState(() {
+        _results = limited;
+        _status = limited.isEmpty
+            ? 'لم أجد ${category.label} قريبة. جرّب تحريك الخريطة أو تفعيل موقعي'
+            : 'تم العثور على ${limited.length} نتيجة من ${category.label}';
+      });
+
+      if (limited.isNotEmpty) {
+        _selectResult(limited.first, drawRoute: false);
+      }
+    } catch (e) {
+      _showMessage('تعذر جلب الأماكن التجارية الآن. تأكد من الإنترنت ثم أعد المحاولة.');
+      setState(() => _status = 'فشل بحث ${category.label}');
+    } finally {
+      if (mounted) {
+        setState(() => _isSearching = false);
+      }
+    }
+  }
+
+  String _buildOverpassQuery(SearchCategory category, LatLng center, int radiusMeters) {
+    final filters = category.filters.map((filter) {
+      return '''
+        node$filter(around:$radiusMeters,${center.latitude},${center.longitude});
+        way$filter(around:$radiusMeters,${center.latitude},${center.longitude});
+        relation$filter(around:$radiusMeters,${center.latitude},${center.longitude});
+      ''';
+    }).join('\n');
+
+    return '''
+      [out:json][timeout:25];
+      (
+        $filters
+      );
+      out center tags 80;
+    ''';
+  }
+
+  LatLng _searchCenter() {
+    final myPoint = _myLatLng;
+    if (myPoint != null && _jordanBounds.contains(myPoint)) return myPoint;
+    try {
+      final center = _mapController.camera.center;
+      if (_jordanBounds.contains(center)) return center;
+    } catch (_) {
+      // The map camera is not ready during the first frame.
+    }
+    return _amman;
+  }
+
+  SearchCategory? _categoryForQuery(String query) {
+    final cleaned = _cleanArabic(query);
+    for (final category in _categories) {
+      for (final keyword in category.keywords) {
+        if (cleaned.contains(_cleanArabic(keyword))) {
+          return category;
+        }
+      }
+    }
+    return null;
+  }
+
+  String _cleanArabic(String value) {
+    return value
+        .toLowerCase()
+        .replaceAll('أ', 'ا')
+        .replaceAll('إ', 'ا')
+        .replaceAll('آ', 'ا')
+        .replaceAll('ة', 'ه')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  double? _readLat(Map<String, dynamic> map) {
+    final center = map['center'];
+    final value = map['lat'] ?? (center is Map ? center['lat'] : null);
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
+  }
+
+  double? _readLon(Map<String, dynamic> map) {
+    final center = map['center'];
+    final value = map['lon'] ?? (center is Map ? center['lon'] : null);
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
+  }
+
+  String _placeName(Map<String, dynamic> tags, String fallback) {
+    final name = tags['name:ar'] ?? tags['name'] ?? tags['brand:ar'] ?? tags['brand'];
+    final text = name?.toString().trim();
+    if (text != null && text.isNotEmpty) return text;
+    return fallback;
+  }
+
+  String _placeType(Map<String, dynamic> tags, String fallback) {
+    final amenity = tags['amenity']?.toString();
+    final shop = tags['shop']?.toString();
+    final healthcare = tags['healthcare']?.toString();
+    final value = amenity ?? shop ?? healthcare;
+    if (value == null || value.isEmpty) return fallback;
+    return _typeLabels[value] ?? value;
+  }
+
+  String _formatDistance(double? meters) {
+    if (meters == null) return '';
+    if (meters < 1000) return '${meters.toStringAsFixed(0)} م';
+    return '${(meters / 1000).toStringAsFixed(1)} كم';
+  }
+
+  static const Map<String, String> _typeLabels = {
+    'supermarket': 'سوبرماركت',
+    'convenience': 'بقالة',
+    'grocery': 'مواد غذائية',
+    'restaurant': 'مطعم',
+    'fast_food': 'وجبات سريعة',
+    'food_court': 'مطاعم',
+    'cafe': 'كافيه',
+    'coffee': 'قهوة',
+    'pharmacy': 'صيدلية',
+    'chemist': 'صيدلية',
+    'fuel': 'محطة وقود',
+    'bank': 'بنك',
+    'atm': 'صراف آلي',
+    'hospital': 'مستشفى',
+    'clinic': 'عيادة',
+    'school': 'مدرسة',
+    'university': 'جامعة',
+    'college': 'كلية',
+  };
 
   void _selectResult(PlaceResult place, {bool drawRoute = true}) {
     setState(() {
@@ -495,7 +792,7 @@ class _JordanMapPageState extends State<JordanMapPage> {
             textInputAction: TextInputAction.search,
             onSubmitted: (_) => _searchJordan(),
             decoration: InputDecoration(
-              hintText: 'ابحث: عمان، الزرقاء، الجامعة الأردنية...',
+              hintText: 'ابحث: محل، صيدلية، مطعم، الجامعة الأردنية...',
               prefixIcon: const Icon(Icons.search),
               suffixIcon: _isSearching
                   ? const Padding(
@@ -516,6 +813,30 @@ class _JordanMapPageState extends State<JordanMapPage> {
                 borderRadius: BorderRadius.circular(18),
                 borderSide: BorderSide.none,
               ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            reverse: true,
+            child: Row(
+              children: _categories.map((category) {
+                return Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 8),
+                  child: ActionChip(
+                    avatar: Icon(category.icon, size: 18, color: const Color(0xFF86EFAC)),
+                    label: Text(category.label),
+                    backgroundColor: const Color(0xFF172554),
+                    side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+                    onPressed: _isSearching
+                        ? null
+                        : () {
+                            _searchController.text = category.label;
+                            _searchBusinessCategory(category);
+                          },
+                  ),
+                );
+              }).toList(),
             ),
           ),
           if (_results.isNotEmpty) ...[
@@ -539,6 +860,15 @@ class _JordanMapPageState extends State<JordanMapPage> {
                       style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
                     subtitle: Text(item.type),
+                    trailing: item.distanceMeters == null
+                        ? null
+                        : Text(
+                            _formatDistance(item.distanceMeters),
+                            style: const TextStyle(
+                              color: Color(0xFF86EFAC),
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
                     onTap: () => _selectResult(item),
                   );
                 },
